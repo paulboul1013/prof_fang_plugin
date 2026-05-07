@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "prof_fang_plugin",
+  "version": "0.1.0",
+  "description": "English listening training on HTML5 video with Speed, Low-Pass, and custom Noise modes.",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "prof_fang_plugin"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content/content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "injected/trainer.js",
+        "assets/noise/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}

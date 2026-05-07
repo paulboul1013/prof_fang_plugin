@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>prof_fang_plugin</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="panel">
+      <h1>prof_fang_plugin</h1>
+
+      <section class="row">
+        <label class="switch-wrap" for="enabled">
+          <span>Plugin</span>
+          <input id="enabled" type="checkbox" />
+          <span id="enabledLabel">OFF</span>
+        </label>
+      </section>
+
+      <section>
+        <h2>Training Mode</h2>
+        <label><input type="radio" name="mode" value="speed" /> Speed Training</label>
+        <label><input type="radio" name="mode" value="lowpass" /> Low-Pass Blur</label>
+        <label><input type="radio" name="mode" value="noise" /> Environment Noise</label>
+      </section>
+
+      <section id="speedSettings" class="mode-settings hidden">
+        <h2>Speed</h2>
+        <select id="speed">
+          <option value="1">1x</option>
+          <option value="1.5">1.5x</option>
+          <option value="2">2x</option>
+          <option value="2.5">2.5x</option>
+          <option value="3">3x</option>
+        </select>
+      </section>
+
+      <section id="lowpassSettings" class="mode-settings hidden">
+        <h2>Low-Pass</h2>
+        <select id="lowPassPreset">
+          <option value="light">Light - 3500 Hz</option>
+          <option value="medium">Medium - 1800 Hz</option>
+          <option value="heavy">Heavy - 900 Hz</option>
+        </select>
+      </section>
+
+      <section id="noiseSettings" class="mode-settings hidden">
+        <h2>Noise</h2>
+        <label for="noiseFile">Track</label>
+        <select id="noiseFile">
+          <option value="People Talking Ambience Sound Effect.mp3">People Talking Ambience</option>
+        </select>
+
+        <label for="noiseVolume">Volume <span id="noiseVolumeLabel">30%</span></label>
+        <input id="noiseVolume" type="range" min="0.1" max="0.5" step="0.05" value="0.3" />
+      </section>
+
+      <p id="status" class="status">Ready</p>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
