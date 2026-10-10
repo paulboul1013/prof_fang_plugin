@@ -64,7 +64,6 @@
     mixGain.connect(audioContext.destination);
 
     let inLowPassPath = false;
-    let noisePlayer = null;
 
     function routeLowPass(enabled) {
       if (enabled === inLowPassPath) {
@@ -84,52 +83,10 @@
       inLowPassPath = enabled;
     }
 
-    function ensureNoisePlayer(noiseUrl) {
-      if (!noiseUrl) {
-        return null;
-      }
-
-      if (noisePlayer && noisePlayer.src === noiseUrl) {
-        return noisePlayer;
-      }
-
-      if (noisePlayer) {
-        noisePlayer.pause();
-      }
-
-      noisePlayer = new Audio(noiseUrl);
-      noisePlayer.loop = true;
-      noisePlayer.preload = "auto";
-      return noisePlayer;
-    }
-
-    async function startNoise(noiseUrl, volume) {
-      const player = ensureNoisePlayer(noiseUrl);
-      if (!player) {
-        return;
-      }
-      player.volume = volume;
-      try {
-        await player.play();
-      } catch (err) {
-        console.warn("[prof_fang_plugin] noise play blocked", err);
-      }
-    }
-
-    function stopNoise() {
-      if (!noisePlayer) {
-        return;
-      }
-      noisePlayer.pause();
-      noisePlayer.currentTime = 0;
-    }
-
     const graph = {
       audioContext,
       lowpassFilter,
-      routeLowPass,
-      startNoise,
-      stopNoise
+      routeLowPass
     };
 
     graphMap.set(video, graph);
@@ -141,10 +98,190 @@
     return graph;
   }
 
+  function createNoiseController() {
+    const events = ["play", "pause", "ended", "volumechange"];
+    let owner = null;
+    let ownerRevision = 0;
+    let player = null;
+    let noiseUrl = "";
+    let noiseVolume = DEFAULT_STATE.noiseVolume;
+    let playRevision = 0;
+    let pendingPlay = null;
+    let onPlayerError = null;
+
+    function isActive() {
+      return owner && latestState?.enabled && latestState.mode === MODES.NOISE &&
+        isCurrentOperation(ownerRevision, owner);
+    }
+
+    function videoVolume() {
+      const volume = Number(owner?.volume);
+      return Number.isFinite(volume) ? Math.max(0, Math.min(1, volume)) : 1;
+    }
+
+    function shouldPlay() {
+      return isActive() && !owner.paused && !owner.ended && !owner.muted &&
+        noiseVolume > 0 && videoVolume() > 0;
+    }
+
+    function pausePlayer(target, reset = false) {
+      target.pause();
+      if (reset) {
+        target.currentTime = 0;
+      }
+    }
+
+    function releasePlayer() {
+      playRevision += 1;
+      pendingPlay = null;
+      const previous = player;
+      player = null;
+      if (previous) {
+        previous.removeEventListener("error", onPlayerError);
+        pausePlayer(previous, true);
+      }
+      onPlayerError = null;
+    }
+
+    function stop() {
+      if (owner) {
+        for (const event of events) {
+          owner.removeEventListener(event, onVideoStateChange);
+        }
+      }
+      owner = null;
+      noiseUrl = "";
+      releasePlayer();
+    }
+
+    function ensurePlayer() {
+      if (!player) {
+        const next = new Audio(noiseUrl);
+        next.loop = true;
+        next.preload = "auto";
+        player = next;
+        onPlayerError = () => {
+          if (player !== next || !isActive()) {
+            return;
+          }
+          releasePlayer();
+          reportStatus(failed("noise-media-failed", next.error));
+        };
+        next.addEventListener("error", onPlayerError);
+      }
+      return player;
+    }
+
+    function isCurrentPlay(request) {
+      return pendingPlay === request && player === request.player &&
+        playRevision === request.revision && isActive();
+    }
+
+    function clearObsoletePlay(request) {
+      // Never let an old play settlement pause a newer valid player. Pending
+      // players are discarded on pause/OFF so they cannot restart after cleanup.
+      if (player !== request.player || !shouldPlay()) {
+        pausePlayer(request.player, true);
+      }
+      return { status: "superseded" };
+    }
+
+    async function sync() {
+      if (!isActive()) {
+        stop();
+        return { status: "superseded" };
+      }
+      if (!shouldPlay()) {
+        if (pendingPlay) {
+          releasePlayer();
+        } else if (player) {
+          pausePlayer(player);
+        }
+        return { status: "applied" };
+      }
+
+      const target = ensurePlayer();
+      target.volume = noiseVolume * videoVolume();
+      if (pendingPlay) {
+        return pendingPlay.promise;
+      }
+      if (!target.paused) {
+        return { status: "applied" };
+      }
+
+      const request = { player: target, revision: ++playRevision, promise: null };
+      pendingPlay = request;
+      request.promise = (async () => {
+        try {
+          await target.play();
+          if (!isCurrentPlay(request)) {
+            return clearObsoletePlay(request);
+          }
+          pendingPlay = null;
+          if (!shouldPlay()) {
+            pausePlayer(target);
+          }
+          return { status: "applied" };
+        } catch (error) {
+          if (!isCurrentPlay(request)) {
+            return clearObsoletePlay(request);
+          }
+          pendingPlay = null;
+          pausePlayer(target);
+          return error?.name === "NotAllowedError"
+            ? { status: "waiting-user-gesture", reason: "noise-play-blocked" }
+            : failed("noise-play-failed", error);
+        }
+      })();
+      return request.promise;
+    }
+
+    function onVideoStateChange(event) {
+      if (event.currentTarget !== owner || !isActive()) {
+        return;
+      }
+      const target = owner;
+      const revision = ownerRevision;
+      const result = sync();
+      const noiseRevision = playRevision;
+      result.then((status) => {
+        if (owner === target && playRevision === noiseRevision && isCurrentOperation(revision, target)) {
+          reportStatus(status);
+        }
+      }).catch((error) => {
+        if (owner === target && playRevision === noiseRevision && isCurrentOperation(revision, target)) {
+          reportStatus(failed("noise-sync-failed", error));
+        }
+      });
+    }
+
+    async function configure(video, state) {
+      stop();
+      if (typeof state.noiseUrl !== "string" || !state.noiseUrl) {
+        return { status: "failed", reason: "noise-url-missing" };
+      }
+      owner = video;
+      ownerRevision = operationRevision;
+      noiseUrl = state.noiseUrl;
+      const volume = Number(state.noiseVolume);
+      noiseVolume = Number.isFinite(volume) ? Math.max(0, Math.min(0.5, volume)) : DEFAULT_STATE.noiseVolume;
+      for (const event of events) {
+        owner.addEventListener(event, onVideoStateChange);
+      }
+      return sync();
+    }
+
+    return { configure, stop };
+  }
+
+  const noiseController = createNoiseController();
+
   function disableAll(video, graph) {
+    // Noise has one owner independent of the current DOM lookup and audio graph.
+    // Clear it even when the old video was already removed from the document.
+    noiseController.stop();
     if (graph) {
       graph.routeLowPass(false);
-      graph.stopNoise();
     }
     if (video) {
       video.playbackRate = 1;
@@ -252,25 +389,23 @@
     const video = currentVideo;
     const activeMode = state.enabled ? state.mode : MODES.OFF;
 
-    if (!pageActive) {
-      return { status: "waiting-video", reason: "page-hidden" };
-    }
-    if (!video) {
-      return { status: activeMode === MODES.OFF ? "applied" : "waiting-video" };
-    }
-
     try {
-      let graph = graphMap.get(video);
+      let graph = video ? graphMap.get(video) : null;
       // Cleanup is synchronous, before any resume/play promise. In particular,
       // an OFF request must invalidate and clear an older pending ON request.
       disableAll(video, graph);
+      if (!pageActive) {
+        return { status: "waiting-video", reason: "page-hidden" };
+      }
+      if (!video) {
+        return { status: activeMode === MODES.OFF ? "applied" : "waiting-video" };
+      }
       if (activeMode === MODES.OFF) {
         return { status: "applied" };
       }
-
       if (activeMode === MODES.SPEED) {
         video.playbackRate = Number(state.speed) || 1;
-      } else if (!graph) {
+      } else if (activeMode === MODES.LOWPASS && !graph) {
         try {
           graph = ensureGraph(video);
         } catch (error) {
@@ -307,11 +442,9 @@
         graph.lowpassFilter.frequency.value = cutoff;
         graph.routeLowPass(true);
       } else if (activeMode === MODES.NOISE) {
-        const volume = Math.max(0, Math.min(0.5, Number(state.noiseVolume) || 0.3));
-        await graph.startNoise(state.noiseUrl, volume);
-        if (!isCurrentOperation(revision, video)) {
-          return { status: "superseded" };
-        }
+        // Noise never creates a media source. A graph previously created by
+        // lowpass must still run its dry path so the original audio is audible.
+        return await noiseController.configure(video, state);
       }
       return { status: "applied" };
     } catch (error) {

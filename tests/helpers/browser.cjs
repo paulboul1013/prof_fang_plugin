@@ -29,7 +29,16 @@ class MockVideo extends EventTarget {
   }
 
   emit(type) {
-    this.dispatchEvent(new Event(type));
+    const event = new Event(type);
+    // Node's EventTarget clears currentTarget before later listeners. DOM
+    // dispatch keeps it set throughout every callback, including a second
+    // extension listener on the same media event.
+    Object.defineProperty(event, "currentTarget", { configurable: true, value: this });
+    try {
+      this.dispatchEvent(event);
+    } finally {
+      Object.defineProperty(event, "currentTarget", { configurable: true, value: null });
+    }
   }
 
   async play() {
@@ -195,6 +204,9 @@ function createBrowser(options = {}) {
       this.playCalls += 1;
       if (options.noisePlayError) {
         throw options.noisePlayError;
+      }
+      if (options.playNoise) {
+        await options.playNoise(this);
       }
       await super.play();
     }
