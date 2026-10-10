@@ -17,6 +17,8 @@ function deferred() {
 class MockVideo extends EventTarget {
   constructor() {
     super();
+    this.nodeType = 1;
+    this.nodeName = "VIDEO";
     this.playbackRate = 1;
     this.paused = false;
     this.ended = false;
