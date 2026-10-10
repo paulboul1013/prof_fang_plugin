@@ -242,6 +242,139 @@ test("a blocked AudioContext reports waiting and keeps the original dry path", a
   assertDry(browser.audioContexts[0]);
 });
 
+test("video play reapplies a blocked lowpass after the AudioContext becomes running", async () => {
+  const browser = createBrowser({ audioContextState: "suspended", resumeAudioContext: () => {
+    throw new Error("User gesture required");
+  } });
+  browser.runTrainer();
+  await apply(browser, lowpass("light"));
+  const context = browser.audioContexts[0];
+  assert.equal(lastStatus(browser).status, "waiting-user-gesture");
+  context.state = "running";
+  browser.video.emit("play");
+  await browser.flush();
+  assert.equal(context.resumeCalls, 1);
+  assert.equal(context.nodes[1].connections.has(context.nodes[3]), true);
+  assert.equal(context.nodes[3].frequency.value, 3500);
+  assert.equal(lastStatus(browser).status, "applied");
+  const before = browser.postedMessages.length;
+  browser.video.emit("play");
+  await browser.flush();
+  assert.equal(browser.postedMessages.length, before);
+});
+
+test("video play can retry a rejected resume and succeed on the next call", async () => {
+  let attempts = 0;
+  const browser = createBrowser({ audioContextState: "suspended", resumeAudioContext: () => {
+    attempts += 1;
+    if (attempts === 1) {
+      throw new Error("First resume blocked");
+    }
+  } });
+  browser.runTrainer();
+  await apply(browser, lowpass("heavy"));
+  browser.video.emit("play");
+  await browser.flush();
+  const context = browser.audioContexts[0];
+  assert.equal(context.resumeCalls, 2);
+  assert.equal(context.nodes[1].connections.has(context.nodes[3]), true);
+  assert.equal(context.nodes[3].frequency.value, 900);
+  assert.equal(lastStatus(browser).status, "applied");
+});
+
+test("noise can retry a blocked cached video graph on play before starting its player", async () => {
+  let attempts = 0;
+  const browser = createBrowser({ audioContextState: "suspended", resumeAudioContext: () => {
+    attempts += 1;
+    if (attempts < 3) {
+      throw new Error("Video graph resume blocked");
+    }
+  } });
+  browser.runTrainer();
+  await apply(browser, lowpass());
+  await apply(browser, { enabled: true, mode: "noise", noiseUrl: "chrome-extension://test/noise.mp3", noiseVolume: 0.2 });
+  assert.equal(lastStatus(browser).reason, "audio-context-blocked");
+  assert.equal(browser.audioPlayers.length, 0);
+  browser.video.emit("play");
+  await browser.flush();
+  assert.equal(browser.audioContexts.length, 1);
+  assert.equal(browser.audioContexts[0].resumeCalls, 3);
+  assertDry(browser.audioContexts[0]);
+  assert.equal(browser.audioPlayers.length, 1);
+  assert.equal(browser.audioPlayers[0].paused, false);
+  assert.equal(browser.audioPlayers[0].volume, 0.2);
+  assert.equal(lastStatus(browser).status, "applied");
+});
+
+test("OFF cancels a blocked graph retry even when the video later plays", async () => {
+  const browser = createBrowser({ audioContextState: "suspended", resumeAudioContext: () => {
+    throw new Error("User gesture required");
+  } });
+  browser.runTrainer();
+  await apply(browser, lowpass());
+  const context = browser.audioContexts[0];
+  await apply(browser, { enabled: false, mode: "lowpass" });
+  context.state = "running";
+  browser.video.emit("play");
+  await browser.flush();
+  assert.equal(context.resumeCalls, 1);
+  assertDry(context);
+  assert.equal(lastStatus(browser).status, "applied");
+});
+
+test("replacement removes a blocked old video's play retry and the new target retains its retry", async () => {
+  const browser = createBrowser({ audioContextState: "suspended", resumeAudioContext: () => {
+    throw new Error("User gesture required");
+  } });
+  browser.runTrainer();
+  await apply(browser, lowpass("medium"));
+  const previous = browser.video;
+  browser.setVideo(new MockVideo());
+  await browser.flush();
+  const [oldContext, newContext] = browser.audioContexts;
+  oldContext.state = "running";
+  previous.emit("play");
+  await browser.flush();
+  assertDry(oldContext);
+  assert.equal(oldContext.resumeCalls, 1);
+  assert.equal(newContext.resumeCalls, 1);
+  assert.equal(lastStatus(browser).status, "waiting-user-gesture");
+  newContext.state = "running";
+  browser.video.emit("play");
+  await browser.flush();
+  assert.equal(newContext.nodes[1].connections.has(newContext.nodes[3]), true);
+  assert.equal(newContext.nodes[3].frequency.value, 1800);
+  assert.equal(lastStatus(browser).status, "applied");
+});
+
+test("only the current graph's running statechange can restore a waiting filter", async () => {
+  const browser = createBrowser({ audioContextState: "suspended", resumeAudioContext: () => {
+    throw new Error("User gesture required");
+  } });
+  browser.runTrainer();
+  await apply(browser, lowpass("light"));
+  browser.setVideo(new MockVideo());
+  await browser.flush();
+  const [oldContext, currentContext] = browser.audioContexts;
+  const before = browser.postedMessages.length;
+  oldContext.state = "running";
+  oldContext.dispatchEvent(new Event("statechange"));
+  await browser.flush();
+  assertDry(oldContext);
+  assertDry(currentContext);
+  assert.equal(browser.postedMessages.length, before);
+  currentContext.state = "running";
+  currentContext.dispatchEvent(new Event("statechange"));
+  await browser.flush();
+  assert.equal(currentContext.nodes[1].connections.has(currentContext.nodes[3]), true);
+  assert.equal(lastStatus(browser).status, "applied");
+  await apply(browser, { enabled: false });
+  currentContext.dispatchEvent(new Event("statechange"));
+  await browser.flush();
+  assertDry(currentContext);
+  assert.equal(lastStatus(browser).status, "applied");
+});
+
 test("a resolved resume that leaves a context suspended is not reported as applied", async () => {
   const browser = createBrowser({ audioContextState: "suspended" });
   const BaseContext = browser.window.AudioContext;

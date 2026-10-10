@@ -39,6 +39,7 @@
   let currentVideo = null;
   let operationRevision = 0;
   let pageActive = true;
+  let needsAudioRetry = false;
 
   function findVideo() {
     return document.querySelector("video");
@@ -132,6 +133,11 @@
     };
 
     graphMap.set(video, graph);
+    audioContext.addEventListener("statechange", () => {
+      if (audioContext.state === "running") {
+        retryAudio(video);
+      }
+    });
     return graph;
   }
 
@@ -147,6 +153,7 @@
 
   function detachTarget(video) {
     video.removeEventListener("loadedmetadata", onVideoLoadedMetadata);
+    video.removeEventListener("play", onVideoPlay);
     // Keep the media source connected to its dry path. Closing its context
     // would also silence the original video's audio if it is used again.
     disableAll(video, graphMap.get(video));
@@ -155,6 +162,7 @@
   function attachTarget(video) {
     currentVideo = video;
     video?.addEventListener("loadedmetadata", onVideoLoadedMetadata);
+    video?.addEventListener("play", onVideoPlay);
   }
 
   function reconcileTarget() {
@@ -164,6 +172,7 @@
     }
 
     operationRevision += 1;
+    needsAudioRetry = false;
     const previousVideo = currentVideo;
     currentVideo = null;
     if (previousVideo) {
@@ -179,6 +188,7 @@
 
   function reportStatus(result) {
     if (result.status !== "superseded") {
+      needsAudioRetry = result.status === "waiting-user-gesture" && result.reason?.startsWith("audio-context-") === true;
       window.postMessage({ source: "PROF_FANG_TRAINER", type: "TRAINER_STATUS", payload: result }, "*");
     }
   }
@@ -198,6 +208,23 @@
     }
     // A player can reuse its video element for a new source. Loading metadata
     // can reset playbackRate even though the DOM target's identity is unchanged.
+    operationRevision += 1;
+    needsAudioRetry = false;
+    reportCurrentResult(applyCurrentSettings());
+  }
+
+  function onVideoPlay(event) {
+    retryAudio(event.currentTarget);
+  }
+
+  function retryAudio(video) {
+    if (!needsAudioRetry || !latestState?.enabled || !pageActive ||
+        video !== currentVideo || findVideo() !== currentVideo) {
+      return;
+    }
+    // A later play or running state can make a blocked graph usable. An
+    // already applied speed/filter is left alone.
+    needsAudioRetry = false;
     operationRevision += 1;
     reportCurrentResult(applyCurrentSettings());
   }
@@ -294,6 +321,7 @@
 
   async function applySettings(rawState) {
     latestState = normalizeState(rawState);
+    needsAudioRetry = false;
     operationRevision += 1;
     try {
       if (pageActive) {
@@ -336,6 +364,7 @@
 
   window.addEventListener("pagehide", () => {
     pageActive = false;
+    needsAudioRetry = false;
     operationRevision += 1;
     videoObserver.disconnect();
     const previousVideo = currentVideo;
