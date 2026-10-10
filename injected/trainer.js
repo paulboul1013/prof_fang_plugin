@@ -35,6 +35,11 @@
   };
 
   const graphMap = new WeakMap();
+  let latestState = null;
+  let currentVideo = null;
+  let operationRevision = 0;
+  let pageActive = true;
+  let needsAudioRetry = false;
 
   function findVideo() {
     return document.querySelector("video");
@@ -128,18 +133,108 @@
     };
 
     graphMap.set(video, graph);
+    audioContext.addEventListener("statechange", () => {
+      if (audioContext.state === "running") {
+        retryAudio(video);
+      }
+    });
     return graph;
   }
 
   function disableAll(video, graph) {
-    video.playbackRate = 1;
     if (graph) {
       graph.routeLowPass(false);
       graph.stopNoise();
     }
+    if (video) {
+      video.playbackRate = 1;
+    }
   }
 
-  async function applySettings(rawState) {
+  function detachTarget(video) {
+    video.removeEventListener("loadedmetadata", onVideoLoadedMetadata);
+    video.removeEventListener("play", onVideoPlay);
+    // Keep the media source connected to its dry path. Closing its context
+    // would also silence the original video's audio if it is used again.
+    disableAll(video, graphMap.get(video));
+  }
+
+  function attachTarget(video) {
+    currentVideo = video;
+    video?.addEventListener("loadedmetadata", onVideoLoadedMetadata);
+    video?.addEventListener("play", onVideoPlay);
+  }
+
+  function reconcileTarget() {
+    const nextVideo = findVideo();
+    if (nextVideo === currentVideo) {
+      return false;
+    }
+
+    operationRevision += 1;
+    needsAudioRetry = false;
+    const previousVideo = currentVideo;
+    currentVideo = null;
+    if (previousVideo) {
+      detachTarget(previousVideo);
+    }
+    attachTarget(nextVideo);
+    return true;
+  }
+
+  function isCurrentOperation(revision, video) {
+    return pageActive && revision === operationRevision && currentVideo === video && findVideo() === video;
+  }
+
+  function reportStatus(result) {
+    if (result.status !== "superseded") {
+      needsAudioRetry = result.status === "waiting-user-gesture" && result.reason?.startsWith("audio-context-") === true;
+      window.postMessage({ source: "PROF_FANG_TRAINER", type: "TRAINER_STATUS", payload: result }, "*");
+    }
+  }
+
+  function reportCurrentResult(promise) {
+    const revision = operationRevision;
+    promise.then((result) => {
+      if (revision === operationRevision) {
+        reportStatus(result);
+      }
+    });
+  }
+
+  function onVideoLoadedMetadata(event) {
+    if (!latestState || !pageActive || event.currentTarget !== currentVideo || findVideo() !== currentVideo) {
+      return;
+    }
+    // A player can reuse its video element for a new source. Loading metadata
+    // can reset playbackRate even though the DOM target's identity is unchanged.
+    operationRevision += 1;
+    needsAudioRetry = false;
+    reportCurrentResult(applyCurrentSettings());
+  }
+
+  function onVideoPlay(event) {
+    retryAudio(event.currentTarget);
+  }
+
+  function retryAudio(video) {
+    if (!needsAudioRetry || !latestState?.enabled || !pageActive ||
+        video !== currentVideo || findVideo() !== currentVideo) {
+      return;
+    }
+    // A later play or running state can make a blocked graph usable. An
+    // already applied speed/filter is left alone.
+    needsAudioRetry = false;
+    operationRevision += 1;
+    reportCurrentResult(applyCurrentSettings());
+  }
+
+  function failed(reason, error) {
+    console.warn("[prof_fang_plugin] settings could not be applied", error);
+    return { status: "failed", reason };
+  }
+
+  function normalizeState(rawState) {
     const state = {
       ...DEFAULT_STATE,
       ...(rawState || {})
@@ -148,43 +243,151 @@
     if (state.mode !== MODES.SPEED && state.mode !== MODES.LOWPASS && state.mode !== MODES.NOISE) {
       state.mode = MODES.SPEED;
     }
+    return state;
+  }
 
-    const video = findVideo();
-    if (!video) {
-      return;
-    }
-
+  async function applyCurrentSettings() {
+    const state = latestState;
+    const revision = operationRevision;
+    const video = currentVideo;
     const activeMode = state.enabled ? state.mode : MODES.OFF;
-    const needsGraph = activeMode === MODES.LOWPASS || activeMode === MODES.NOISE;
-    const graph = needsGraph ? ensureGraph(video) : graphMap.get(video);
 
-    if (graph && graph.audioContext.state !== "running") {
-      try {
-        await graph.audioContext.resume();
-      } catch (err) {
-        console.warn("[prof_fang_plugin] AudioContext resume blocked", err);
+    if (!pageActive) {
+      return { status: "waiting-video", reason: "page-hidden" };
+    }
+    if (!video) {
+      return { status: activeMode === MODES.OFF ? "applied" : "waiting-video" };
+    }
+
+    try {
+      let graph = graphMap.get(video);
+      // Cleanup is synchronous, before any resume/play promise. In particular,
+      // an OFF request must invalidate and clear an older pending ON request.
+      disableAll(video, graph);
+      if (activeMode === MODES.OFF) {
+        return { status: "applied" };
       }
-    }
 
-    disableAll(video, graph);
+      if (activeMode === MODES.SPEED) {
+        video.playbackRate = Number(state.speed) || 1;
+      } else if (!graph) {
+        try {
+          graph = ensureGraph(video);
+        } catch (error) {
+          return failed("audio-graph-failed", error);
+        }
+      }
 
-    if (activeMode === MODES.SPEED) {
-      video.playbackRate = Number(state.speed) || 1;
-      return;
-    }
+      if (graph && graph.audioContext.state !== "running") {
+        if (graph.audioContext.state === "closed") {
+          return { status: "failed", reason: "audio-context-closed" };
+        }
+        try {
+          await graph.audioContext.resume();
+        } catch (error) {
+          if (!isCurrentOperation(revision, video)) {
+            return { status: "superseded" };
+          }
+          console.warn("[prof_fang_plugin] AudioContext resume blocked", error);
+          return { status: "waiting-user-gesture", reason: "audio-context-blocked" };
+        }
+        if (!isCurrentOperation(revision, video)) {
+          return { status: "superseded" };
+        }
+        if (graph.audioContext.state !== "running") {
+          return { status: "waiting-user-gesture", reason: "audio-context-suspended" };
+        }
+      }
 
-    if (activeMode === MODES.LOWPASS) {
-      graph.routeLowPass(true);
-      const cutoff = LOWPASS_PRESETS[state.lowPassPreset] || LOWPASS_PRESETS.medium;
-      graph.lowpassFilter.frequency.value = cutoff;
-      return;
-    }
-
-    if (activeMode === MODES.NOISE) {
-      const volume = Math.max(0, Math.min(0.5, Number(state.noiseVolume) || 0.3));
-      await graph.startNoise(state.noiseUrl, volume);
+      if (!isCurrentOperation(revision, video)) {
+        return { status: "superseded" };
+      }
+      if (activeMode === MODES.LOWPASS) {
+        const cutoff = LOWPASS_PRESETS[state.lowPassPreset] || LOWPASS_PRESETS.medium;
+        graph.lowpassFilter.frequency.value = cutoff;
+        graph.routeLowPass(true);
+      } else if (activeMode === MODES.NOISE) {
+        const volume = Math.max(0, Math.min(0.5, Number(state.noiseVolume) || 0.3));
+        await graph.startNoise(state.noiseUrl, volume);
+        if (!isCurrentOperation(revision, video)) {
+          return { status: "superseded" };
+        }
+      }
+      return { status: "applied" };
+    } catch (error) {
+      return isCurrentOperation(revision, video) ? failed("apply-failed", error) : { status: "superseded" };
     }
   }
+
+  async function applySettings(rawState) {
+    latestState = normalizeState(rawState);
+    needsAudioRetry = false;
+    operationRevision += 1;
+    try {
+      if (pageActive) {
+        reconcileTarget();
+      }
+      return await applyCurrentSettings();
+    } catch (error) {
+      return failed("target-cleanup-failed", error);
+    }
+  }
+
+  function includesVideo(nodes) {
+    return Array.from(nodes).some((node) => node === currentVideo || node.nodeName === "VIDEO" || node.querySelector?.("video"));
+  }
+
+  const videoObserver = new MutationObserver((records) => {
+    if (!latestState || !pageActive) {
+      return;
+    }
+    // Most page mutations have no effect on the managed video (for example,
+    // chat messages). Do not query the whole document or reapply for those.
+    const targetMayHaveChanged = currentVideo?.isConnected === false || records.some((record) =>
+      includesVideo(record.addedNodes) || includesVideo(record.removedNodes));
+    if (!targetMayHaveChanged) {
+      return;
+    }
+    try {
+      if (reconcileTarget()) {
+        reportCurrentResult(applyCurrentSettings());
+      }
+    } catch (error) {
+      reportStatus(failed("target-cleanup-failed", error));
+    }
+  });
+
+  function observeVideos() {
+    videoObserver.observe(document.documentElement || document, { childList: true, subtree: true });
+  }
+  observeVideos();
+
+  window.addEventListener("pagehide", () => {
+    pageActive = false;
+    needsAudioRetry = false;
+    operationRevision += 1;
+    videoObserver.disconnect();
+    const previousVideo = currentVideo;
+    currentVideo = null;
+    if (previousVideo) {
+      try {
+        detachTarget(previousVideo);
+      } catch (error) {
+        reportStatus(failed("target-cleanup-failed", error));
+      }
+    }
+  });
+
+  window.addEventListener("pageshow", () => {
+    if (pageActive) {
+      return;
+    }
+    pageActive = true;
+    observeVideos();
+    if (latestState) {
+      reportCurrentResult(applySettings(latestState));
+    }
+  });
 
   window.addEventListener("message", (event) => {
     if (event.source !== window) {
@@ -197,7 +400,7 @@
     if (message.type === "TRAINER_PING") {
       announceReady();
     } else if (message.type === "APPLY_SETTINGS") {
-      applySettings(message.payload);
+      reportCurrentResult(applySettings(message.payload));
     }
   });
 

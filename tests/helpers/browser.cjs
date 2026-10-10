@@ -17,6 +17,8 @@ function deferred() {
 class MockVideo extends EventTarget {
   constructor() {
     super();
+    this.nodeType = 1;
+    this.nodeName = "VIDEO";
     this.playbackRate = 1;
     this.paused = false;
     this.ended = false;
@@ -136,8 +138,9 @@ function createBrowser(options = {}) {
     };
   }
 
-  class MockAudioContext {
+  class MockAudioContext extends EventTarget {
     constructor() {
+      super();
       this.state = options.audioContextState || "running";
       this.destination = {};
       this.nodes = [];
@@ -174,6 +177,7 @@ function createBrowser(options = {}) {
         await options.resumeAudioContext(this);
       }
       this.state = "running";
+      this.dispatchEvent(new Event("statechange"));
     }
   }
 
