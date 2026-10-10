@@ -3,6 +3,9 @@
   const BRIDGE_FLAG = "__PROF_FANG_BRIDGE_ACTIVE__";
   const DEFAULT_NOISE_FILE = "People Talking Ambience Sound Effect.mp3";
   const READY_TIMEOUT_MS = 5000;
+  // How long the popup's request waits for the trainer's own result. A later
+  // TRAINER_STATUS still updates the cached status and any open popup.
+  const APPLY_TIMEOUT_MS = 4000;
 
   // Content script reinjection must not add another bridge or runtime listener.
   if (window[BRIDGE_FLAG]) {
@@ -14,13 +17,18 @@
   let readyAttempt = null;
   let settingsRevision = 0;
   let latestSettings = null;
+  // The latest known result for this tab, reported by the trainer. Only
+  // results for the newest request (settingsRevision) are accepted.
+  let latestStatus = { requestId: 0, status: "idle" };
+  let statusWaiter = null;
 
-  function sendToPage(type, payload) {
+  function sendToPage(type, payload, requestId) {
     window.postMessage(
       {
         source: "PROF_FANG_EXTENSION",
         type,
-        payload
+        payload,
+        ...(requestId ? { requestId } : {})
       },
       "*"
     );
@@ -31,14 +39,16 @@
     attempt.script?.remove();
   }
 
-  function failAttempt(attempt, reason) {
+  function failAttempt(attempt, reason, code) {
     // A removed, slow script can still finish after another attempt starts.
     if (readyAttempt !== attempt) {
       return;
     }
     cleanupAttempt(attempt);
     readyAttempt = null;
-    attempt.reject(new Error(reason));
+    const error = new Error(reason);
+    error.code = code;
+    attempt.reject(error);
   }
 
   function ensureTrainerReady() {
@@ -56,7 +66,7 @@
     });
     readyAttempt = attempt;
     attempt.timer = setTimeout(() => {
-      failAttempt(attempt, "Trainer did not become ready in time");
+      failAttempt(attempt, "Trainer did not become ready in time", "trainer-timeout");
     }, READY_TIMEOUT_MS);
 
     // Recover an already initialized trainer if its first READY was missed.
@@ -69,10 +79,10 @@
       script.async = false;
       // Loading the file does not prove that its message listener is ready.
       script.onload = () => script.remove();
-      script.onerror = () => failAttempt(attempt, "Trainer script could not be loaded");
+      script.onerror = () => failAttempt(attempt, "Trainer script could not be loaded", "trainer-load-failed");
       (document.head || document.documentElement).appendChild(script);
     } catch (error) {
-      failAttempt(attempt, error.message || "Trainer script could not be loaded");
+      failAttempt(attempt, error.message || "Trainer script could not be loaded", "trainer-load-failed");
     }
 
     return attempt.promise;
@@ -80,6 +90,10 @@
 
   window.addEventListener("message", (event) => {
     if (event.source !== window || event.data?.source !== "PROF_FANG_TRAINER") {
+      return;
+    }
+    if (event.data.type === "TRAINER_STATUS") {
+      onTrainerStatus(event.data.payload);
       return;
     }
     if (event.data.type !== "TRAINER_READY") {
@@ -103,25 +117,107 @@
     };
   }
 
+  function notifyPopup(status) {
+    // The popup may be closed; nobody listening is not an error.
+    try {
+      const sent = chrome.runtime.sendMessage?.({ type: "PROF_FANG_STATUS", payload: status });
+      sent?.catch?.(() => {});
+    } catch (_error) {
+      // Extension context can be invalidated after an update or reload.
+    }
+  }
+
+  function setLatestStatus(requestId, result) {
+    if (requestId !== settingsRevision) {
+      return false;
+    }
+    latestStatus = {
+      requestId,
+      status: result.status,
+      ...(result.reason ? { reason: result.reason } : {})
+    };
+    notifyPopup(latestStatus);
+    return true;
+  }
+
+  function onTrainerStatus(payload) {
+    // Untagged or older results must not overwrite the newest operation.
+    if (!payload || typeof payload.status !== "string" || payload.requestId !== settingsRevision) {
+      return;
+    }
+    setLatestStatus(payload.requestId, payload);
+    if (statusWaiter?.requestId === payload.requestId) {
+      const waiter = statusWaiter;
+      statusWaiter = null;
+      clearTimeout(waiter.timer);
+      waiter.resolve(latestStatus);
+    }
+  }
+
+  function supersedeWaiter() {
+    if (statusWaiter) {
+      const waiter = statusWaiter;
+      statusWaiter = null;
+      clearTimeout(waiter.timer);
+      waiter.resolve({ requestId: waiter.requestId, status: "superseded", superseded: true });
+    }
+  }
+
+  function waitForTrainerStatus(requestId) {
+    return new Promise((resolve) => {
+      const waiter = { requestId, resolve };
+      waiter.timer = setTimeout(() => {
+        if (statusWaiter !== waiter) {
+          return;
+        }
+        statusWaiter = null;
+        setLatestStatus(requestId, { status: "timeout", reason: "trainer-no-response" });
+        resolve(latestStatus);
+      }, APPLY_TIMEOUT_MS);
+      statusWaiter = waiter;
+    });
+  }
+
+  function toResponse(status) {
+    const ok = status.status !== "failed" && status.status !== "timeout";
+    return { ok, ...status };
+  }
+
   async function queueLatestSettings(state) {
     const revision = ++settingsRevision;
     latestSettings = enrichSettings(state);
-    await ensureTrainerReady();
-    if (revision !== settingsRevision) {
-      return { ok: true, superseded: true };
+    supersedeWaiter();
+    setLatestStatus(revision, { status: trainerReady ? "applying" : "waiting-trainer" });
+    try {
+      await ensureTrainerReady();
+    } catch (error) {
+      if (revision !== settingsRevision) {
+        return { ok: true, superseded: true, requestId: revision, status: "superseded" };
+      }
+      setLatestStatus(revision, { status: "failed", reason: error.code || "trainer-load-failed" });
+      return toResponse(latestStatus);
     }
-    sendToPage("APPLY_SETTINGS", latestSettings);
-    // Actual application acknowledgement is separate from trainer readiness.
-    return { ok: true };
+    if (revision !== settingsRevision) {
+      return { ok: true, superseded: true, requestId: revision, status: "superseded" };
+    }
+    setLatestStatus(revision, { status: "applying" });
+    const result = waitForTrainerStatus(revision);
+    sendToPage("APPLY_SETTINGS", latestSettings, revision);
+    // Only the trainer's own result proves the settings took effect.
+    return toResponse(await result);
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === "PROF_FANG_GET_STATUS") {
+      sendResponse(toResponse(latestStatus));
+      return false;
+    }
     if (message?.type !== "PROF_FANG_APPLY_SETTINGS") {
       return false;
     }
     queueLatestSettings(message.payload).then(
       sendResponse,
-      (error) => sendResponse({ ok: false, error: error.message })
+      (error) => sendResponse({ ok: false, status: "failed", reason: "content-error", error: error.message })
     );
     return true;
   });

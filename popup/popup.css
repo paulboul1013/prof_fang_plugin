@@ -88,3 +88,31 @@ input[type="range"] {
 .status.ok {
   color: #116530;
 }
+
+.status.warn {
+  color: #92400e;
+}
+
+.status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.retry {
+  flex: none;
+  margin-top: 6px;
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--accent);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.retry.hidden {
+  display: none;
+}

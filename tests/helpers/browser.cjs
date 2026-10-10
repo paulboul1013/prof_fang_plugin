@@ -64,6 +64,9 @@ function createBrowser(options = {}) {
   const scripts = [];
   const postedMessages = [];
   const runtimeListeners = [];
+  // Extension pages (the popup) that receive chrome.runtime.sendMessage.
+  const extensionListeners = [];
+  const tabId = options.tabId ?? 1;
   const audioContexts = [];
   const audioPlayers = [];
   const observers = [];
@@ -226,6 +229,17 @@ function createBrowser(options = {}) {
         addListener(listener) {
           runtimeListeners.push(listener);
         }
+      },
+      sendMessage(message) {
+        if (!extensionListeners.length) {
+          return Promise.reject(new Error("Could not establish connection. Receiving end does not exist."));
+        }
+        const data = structuredClone(message);
+        return Promise.resolve().then(() => {
+          for (const listener of [...extensionListeners]) {
+            listener(structuredClone(data), { tab: { id: tabId } }, () => {});
+          }
+        });
       }
     },
     storage: {
@@ -355,6 +369,8 @@ function createBrowser(options = {}) {
     scripts,
     postedMessages,
     runtimeListeners,
+    extensionListeners,
+    tabId,
     windowListeners,
     audioContexts,
     audioPlayers,
@@ -379,4 +395,129 @@ function createBrowser(options = {}) {
   };
 }
 
-module.exports = { createBrowser, MockVideo, deferred };
+function createElement(id) {
+  const listeners = new Map();
+  const classes = new Set(id === "retry" ? ["retry", "hidden"] : []);
+  return {
+    id,
+    textContent: "",
+    className: "",
+    value: "",
+    checked: false,
+    disabled: false,
+    classList: {
+      toggle(name, force) {
+        const on = force === undefined ? !classes.has(name) : force;
+        if (on) {
+          classes.add(name);
+        } else {
+          classes.delete(name);
+        }
+        return on;
+      },
+      contains(name) {
+        return classes.has(name);
+      }
+    },
+    addEventListener(type, listener) {
+      if (!listeners.has(type)) {
+        listeners.set(type, []);
+      }
+      listeners.get(type).push(listener);
+    },
+    fire(type) {
+      return Promise.all((listeners.get(type) || []).map((listener) => listener({ currentTarget: this })));
+    }
+  };
+}
+
+// Runs the production popup script against a page created by createBrowser.
+// The popup shares the extension's storage and reaches the page's content
+// script through chrome.tabs.sendMessage, as in the real extension.
+function createPopup(browser, options = {}) {
+  const elements = new Map();
+  const getElement = (id) => {
+    if (!elements.has(id)) {
+      elements.set(id, createElement(id));
+    }
+    return elements.get(id);
+  };
+  const modeRadios = ["speed", "lowpass", "noise"].map((value) => {
+    const radio = createElement(`mode-${value}`);
+    radio.value = value;
+    return radio;
+  });
+  const listeners = [];
+  const context = vm.createContext({
+    console: { warn() {}, log() {}, error() {} },
+    document: {
+      getElementById: getElement,
+      querySelectorAll(selector) {
+        return selector === "input[name='mode']" ? modeRadios : [];
+      }
+    },
+    chrome: {
+      storage: browser.chrome.storage,
+      runtime: {
+        onMessage: {
+          addListener(listener) {
+            listeners.push(listener);
+            browser.extensionListeners.push(listener);
+          }
+        }
+      },
+      tabs: {
+        async query() {
+          return [{ id: options.tabId ?? browser.tabId }];
+        },
+        async sendMessage(_tabId, message) {
+          if (options.unreachable) {
+            throw new Error("Could not establish connection. Receiving end does not exist.");
+          }
+          return browser.sendRuntime(message);
+        }
+      }
+    }
+  });
+  vm.runInContext(fs.readFileSync(path.join(REPO_ROOT, "popup/popup.js"), "utf8"), context, {
+    filename: "popup/popup.js"
+  });
+  return {
+    context,
+    element: getElement,
+    modeRadios,
+    get status() { return getElement("status").textContent; },
+    get statusLevel() { return getElement("status").className; },
+    get retryVisible() { return !getElement("retry").classList.contains("hidden"); },
+    close() {
+      for (const listener of listeners) {
+        const index = browser.extensionListeners.indexOf(listener);
+        if (index >= 0) {
+          browser.extensionListeners.splice(index, 1);
+        }
+      }
+    },
+    // Simulates the user changing popup controls.
+    async setEnabled(enabled) {
+      const toggle = getElement("enabled");
+      toggle.checked = enabled;
+      return toggle.fire("change");
+    },
+    async setMode(mode) {
+      for (const radio of modeRadios) {
+        radio.checked = radio.value === mode;
+      }
+      return modeRadios.find((radio) => radio.value === mode).fire("change");
+    },
+    async setSpeed(value) {
+      const select = getElement("speed");
+      select.value = String(value);
+      return select.fire("change");
+    },
+    retry() {
+      return getElement("retry").fire("click");
+    }
+  };
+}
+
+module.exports = { createBrowser, createPopup, MockVideo, deferred };

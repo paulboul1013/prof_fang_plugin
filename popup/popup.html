@@ -56,7 +56,10 @@
         <input id="noiseVolume" type="range" min="0.1" max="0.5" step="0.05" value="0.3" />
       </section>
 
-      <p id="status" class="status">Ready</p>
+      <div class="status-row">
+        <p id="status" class="status" role="status" aria-live="polite">Ready</p>
+        <button id="retry" type="button" class="retry hidden">Retry</button>
+      </div>
     </main>
 
     <script src="popup.js"></script>

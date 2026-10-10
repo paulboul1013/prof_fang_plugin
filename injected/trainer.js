@@ -34,12 +34,20 @@
     noiseVolume: 0.3
   };
 
+  // Chrome can leave resume() pending until the user interacts with the page.
+  // Report that as waiting for a gesture instead of never answering; the
+  // statechange listener retries once the context actually runs.
+  const RESUME_WAIT_MS = 1000;
+
   const graphMap = new WeakMap();
   let latestState = null;
   let currentVideo = null;
   let operationRevision = 0;
   let pageActive = true;
   let needsAudioRetry = false;
+  // Every status report is tagged with the newest request so the content
+  // script can discard results that belong to an older popup action.
+  let latestRequestId = null;
 
   function findVideo() {
     return document.querySelector("video");
@@ -326,7 +334,11 @@
   function reportStatus(result) {
     if (result.status !== "superseded") {
       needsAudioRetry = result.status === "waiting-user-gesture" && result.reason?.startsWith("audio-context-") === true;
-      window.postMessage({ source: "PROF_FANG_TRAINER", type: "TRAINER_STATUS", payload: result }, "*");
+      window.postMessage({
+        source: "PROF_FANG_TRAINER",
+        type: "TRAINER_STATUS",
+        payload: { ...result, requestId: latestRequestId }
+      }, "*");
     }
   }
 
@@ -417,17 +429,32 @@
         if (graph.audioContext.state === "closed") {
           return { status: "failed", reason: "audio-context-closed" };
         }
+        let outcome;
+        let waitTimer;
         try {
-          await graph.audioContext.resume();
+          const resumed = graph.audioContext.resume();
+          // A rejection after the wait elapsed is already reported as waiting.
+          resumed.catch(() => {});
+          outcome = await Promise.race([
+            resumed.then(() => "resumed"),
+            new Promise((resolve) => {
+              waitTimer = setTimeout(() => resolve("pending"), RESUME_WAIT_MS);
+            })
+          ]);
         } catch (error) {
           if (!isCurrentOperation(revision, video)) {
             return { status: "superseded" };
           }
           console.warn("[prof_fang_plugin] AudioContext resume blocked", error);
           return { status: "waiting-user-gesture", reason: "audio-context-blocked" };
+        } finally {
+          clearTimeout(waitTimer);
         }
         if (!isCurrentOperation(revision, video)) {
           return { status: "superseded" };
+        }
+        if (outcome === "pending") {
+          return { status: "waiting-user-gesture", reason: "audio-context-suspended" };
         }
         if (graph.audioContext.state !== "running") {
           return { status: "waiting-user-gesture", reason: "audio-context-suspended" };
@@ -533,6 +560,7 @@
     if (message.type === "TRAINER_PING") {
       announceReady();
     } else if (message.type === "APPLY_SETTINGS") {
+      latestRequestId = message.requestId ?? null;
       reportCurrentResult(applySettings(message.payload));
     }
   });
