@@ -1,4 +1,16 @@
 (() => {
+  const READY_FLAG = "__PROF_FANG_TRAINER_READY__";
+
+  function announceReady() {
+    window.postMessage({ source: "PROF_FANG_TRAINER", type: "TRAINER_READY" }, "*");
+  }
+
+  // A timeout retry can load the file while an earlier injection finishes.
+  if (window[READY_FLAG]) {
+    announceReady();
+    return;
+  }
+
   const MODES = {
     OFF: "off",
     SPEED: "speed",
@@ -182,8 +194,13 @@
     if (!message || message.source !== "PROF_FANG_EXTENSION") {
       return;
     }
-    if (message.type === "APPLY_SETTINGS") {
+    if (message.type === "TRAINER_PING") {
+      announceReady();
+    } else if (message.type === "APPLY_SETTINGS") {
       applySettings(message.payload);
     }
   });
+
+  window[READY_FLAG] = true;
+  announceReady();
 })();
