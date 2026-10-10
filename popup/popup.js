@@ -21,14 +21,77 @@ const els = {
   noiseFile: document.getElementById("noiseFile"),
   noiseVolume: document.getElementById("noiseVolume"),
   noiseVolumeLabel: document.getElementById("noiseVolumeLabel"),
-  status: document.getElementById("status")
+  status: document.getElementById("status"),
+  retry: document.getElementById("retry")
 };
 
 let currentState = { ...DEFAULT_STATE };
+// Popup-side sequence of apply actions. Only the newest one may update the UI.
+let applySeq = 0;
+// Content-side request ids. A status below minRequestId belongs to an older
+// action and must not replace what the user sees now.
+let lastRequestId = 0;
+let minRequestId = 0;
+let activeTabId = null;
 
-function setStatus(msg, level = "") {
+function setStatus(msg, level = "", canRetry = false) {
   els.status.textContent = msg;
   els.status.className = `status ${level}`.trim();
+  els.retry?.classList.toggle("hidden", !canRetry);
+}
+
+const FAILURE_TEXT = {
+  "trainer-load-failed": "Trainer could not be loaded on this page",
+  "trainer-timeout": "Trainer did not start in time",
+  "trainer-no-response": "No response from the page",
+  "noise-url-missing": "Noise track is missing",
+  "noise-media-failed": "Noise track could not be loaded",
+  "noise-play-failed": "Noise track could not be played",
+  "audio-context-closed": "Audio is unavailable for this video",
+  "audio-graph-failed": "Audio is unavailable for this video"
+};
+
+// Map the trainer's real result to what the user sees. "Applied" is only
+// shown when the trainer confirms the settings took effect.
+function showResult(result) {
+  switch (result?.status) {
+    case "idle":
+      setStatus("Ready");
+      return;
+    case "applied":
+      setStatus(currentState.enabled ? "Applied" : "Off - normal playback", "ok");
+      return;
+    case "applying":
+      setStatus("Applying...");
+      return;
+    case "waiting-trainer":
+      setStatus("Loading trainer...");
+      return;
+    case "waiting-video":
+      setStatus(result.reason === "page-hidden" ? "Waiting for the page" : "Waiting for a video on this page", "warn");
+      return;
+    case "waiting-user-gesture":
+      setStatus("Press play on the video to start audio training", "warn");
+      return;
+    case "timeout":
+      setStatus(FAILURE_TEXT[result.reason] || "No response from the page", "error", true);
+      return;
+    case "failed":
+      setStatus(FAILURE_TEXT[result.reason] || "Could not apply settings", "error", true);
+      return;
+    default:
+      setStatus("Cannot apply on this page", "error", true);
+  }
+}
+
+function acceptRequestId(result) {
+  const requestId = Number(result?.requestId);
+  if (!Number.isFinite(requestId) || requestId < minRequestId) {
+    return false;
+  }
+  lastRequestId = Math.max(lastRequestId, requestId);
+  minRequestId = requestId;
+  return true;
 }
 
 function mergeState(loaded) {
@@ -80,20 +143,77 @@ async function getActiveTabId() {
 }
 
 async function pushToActiveTab() {
+  const seq = ++applySeq;
+  // Any status the popup has already seen is now stale; the page assigns this
+  // action a newer request id.
+  minRequestId = lastRequestId + 1;
+  setStatus("Applying...");
   const tabId = await getActiveTabId();
+  if (seq !== applySeq) {
+    return;
+  }
+  activeTabId = tabId ?? null;
   if (!tabId) {
     setStatus("No active tab", "error");
     return;
   }
 
+  let response;
   try {
-    await chrome.tabs.sendMessage(tabId, {
+    response = await chrome.tabs.sendMessage(tabId, {
       type: "PROF_FANG_APPLY_SETTINGS",
       payload: currentState
     });
-    setStatus("Applied", "ok");
   } catch (err) {
-    setStatus("Cannot apply on this page", "error");
+    if (seq === applySeq) {
+      // The page never received this action, so no newer id was assigned.
+      minRequestId = lastRequestId;
+      setStatus("Cannot apply on this page", "error", true);
+    }
+    return;
+  }
+  // A newer action owns the status line; an older result must not overwrite it.
+  if (seq !== applySeq || response?.superseded) {
+    return;
+  }
+  if (!response || typeof response.status !== "string") {
+    setStatus("Cannot apply on this page", "error", true);
+    return;
+  }
+  if (acceptRequestId(response) || response.requestId === undefined) {
+    showResult(response);
+  }
+}
+
+function onRuntimeMessage(message, sender) {
+  if (message?.type !== "PROF_FANG_STATUS") {
+    return;
+  }
+  // Statuses come from every tab's content script; show only this tab's.
+  if (activeTabId == null || sender?.tab?.id !== activeTabId) {
+    return;
+  }
+  if (acceptRequestId(message.payload)) {
+    showResult(message.payload);
+  }
+}
+
+async function loadTabStatus() {
+  const tabId = await getActiveTabId();
+  activeTabId = tabId ?? null;
+  if (!tabId) {
+    return;
+  }
+  const seq = applySeq;
+  try {
+    const status = await chrome.tabs.sendMessage(tabId, { type: "PROF_FANG_GET_STATUS" });
+    if (seq === applySeq && acceptRequestId(status)) {
+      showResult(status);
+    }
+  } catch (err) {
+    if (seq === applySeq) {
+      setStatus("Not available on this page", "error");
+    }
   }
 }
 
@@ -103,6 +223,10 @@ async function persistAndApply() {
 }
 
 function bindEvents() {
+  els.retry?.addEventListener("click", () => {
+    pushToActiveTab();
+  });
+
   els.enabled.addEventListener("change", async () => {
     currentState.enabled = els.enabled.checked;
     render();
@@ -153,7 +277,10 @@ async function init() {
     currentState = mergeState(data[STORAGE_KEY]);
     render();
     bindEvents();
+    chrome.runtime?.onMessage?.addListener(onRuntimeMessage);
     setStatus("Ready");
+    // Reopening the popup shows the tab's actual state, not a guess.
+    await loadTabStatus();
   } catch (err) {
     setStatus("Init failed", "error");
   }
