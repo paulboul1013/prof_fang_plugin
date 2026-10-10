@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createBrowser, MockVideo, deferred } = require("./helpers/browser.cjs");
+const { assertCutoff, isBlurred, isDry } = require("./helpers/browser.cjs");
 
 const speed = (value) => ({ enabled: true, mode: "speed", speed: value });
 const lowpass = (preset = "heavy") => ({ enabled: true, mode: "lowpass", lowPassPreset: preset });
@@ -16,9 +17,7 @@ async function apply(browser, settings) {
 }
 
 function assertDry(context) {
-  const [, input, mix, filter] = context.nodes;
-  assert.equal(input.connections.has(mix), true);
-  assert.equal(input.connections.has(filter), false);
+  assert.equal(isDry(context), true);
 }
 
 test("a trainer without settings does not reset a page's own playback rate", async () => {
@@ -119,7 +118,7 @@ test("waiting video retains the newest lowpass preset", async () => {
   browser.setVideo(new MockVideo());
   await browser.flush();
   assert.equal(browser.audioContexts.length, 1);
-  assert.equal(browser.audioContexts[0].nodes[3].frequency.value, 900);
+  assertCutoff(browser.audioContexts[0], 900);
   assert.equal(lastStatus(browser).status, "applied");
 });
 
@@ -134,14 +133,14 @@ test("lowpass replacement cleans the old path and reattachment reuses its media 
   assertDry(originalContext);
   assert.equal(originalContext.state, "running");
   assert.equal(browser.audioContexts.length, 2);
-  assert.equal(browser.audioContexts[1].nodes[3].frequency.value, 1800);
+  assertCutoff(browser.audioContexts[1], 2000);
   browser.setVideo(null);
   await browser.flush();
   assertDry(browser.audioContexts[1]);
   browser.setVideo(previous);
   await browser.flush();
   assert.equal(browser.audioContexts.length, 2);
-  assert.equal(originalContext.nodes[1].connections.has(originalContext.nodes[3]), true);
+  assert.equal(isBlurred(originalContext), true);
   assert.equal(lastStatus(browser).status, "applied");
 });
 
@@ -201,10 +200,10 @@ test("an older resumed lowpass operation cannot overwrite a newer preset", async
   await apply(browser, lowpass("light"));
   resumes[1].resolve();
   await browser.flush();
-  assert.equal(browser.audioContexts[0].nodes[3].frequency.value, 3500);
+  assertCutoff(browser.audioContexts[0], 4000);
   resumes[0].resolve();
   await browser.flush();
-  assert.equal(browser.audioContexts[0].nodes[3].frequency.value, 3500);
+  assertCutoff(browser.audioContexts[0], 4000);
   assert.equal(lastStatus(browser).status, "applied");
 });
 
@@ -227,7 +226,7 @@ test("an old video's pending resume cannot enable its filter after replacement",
   assert.equal(previous.playbackRate, 1);
   resumes[1].resolve();
   await browser.flush();
-  assert.equal(browser.audioContexts[1].nodes[1].connections.has(browser.audioContexts[1].nodes[3]), true);
+  assert.equal(isBlurred(browser.audioContexts[1]), true);
   assert.equal(lastStatus(browser).status, "applied");
 });
 
@@ -254,8 +253,8 @@ test("video play reapplies a blocked lowpass after the AudioContext becomes runn
   browser.video.emit("play");
   await browser.flush();
   assert.equal(context.resumeCalls, 1);
-  assert.equal(context.nodes[1].connections.has(context.nodes[3]), true);
-  assert.equal(context.nodes[3].frequency.value, 3500);
+  assert.equal(isBlurred(context), true);
+  assertCutoff(context, 4000);
   assert.equal(lastStatus(browser).status, "applied");
   const before = browser.postedMessages.length;
   browser.video.emit("play");
@@ -277,8 +276,8 @@ test("video play can retry a rejected resume and succeed on the next call", asyn
   await browser.flush();
   const context = browser.audioContexts[0];
   assert.equal(context.resumeCalls, 2);
-  assert.equal(context.nodes[1].connections.has(context.nodes[3]), true);
-  assert.equal(context.nodes[3].frequency.value, 900);
+  assert.equal(isBlurred(context), true);
+  assertCutoff(context, 900);
   assert.equal(lastStatus(browser).status, "applied");
 });
 
@@ -342,8 +341,8 @@ test("replacement removes a blocked old video's play retry and the new target re
   newContext.state = "running";
   browser.video.emit("play");
   await browser.flush();
-  assert.equal(newContext.nodes[1].connections.has(newContext.nodes[3]), true);
-  assert.equal(newContext.nodes[3].frequency.value, 1800);
+  assert.equal(isBlurred(newContext), true);
+  assertCutoff(newContext, 2000);
   assert.equal(lastStatus(browser).status, "applied");
 });
 
@@ -366,7 +365,7 @@ test("only the current graph's running statechange can restore a waiting filter"
   currentContext.state = "running";
   currentContext.dispatchEvent(new Event("statechange"));
   await browser.flush();
-  assert.equal(currentContext.nodes[1].connections.has(currentContext.nodes[3]), true);
+  assert.equal(isBlurred(currentContext), true);
   assert.equal(lastStatus(browser).status, "applied");
   await apply(browser, { enabled: false });
   currentContext.dispatchEvent(new Event("statechange"));
@@ -439,7 +438,7 @@ test("pagehide invalidates pending work and a cached page restores its settings 
   await browser.flush();
   assert.equal(browser.observers[0].connected, true);
   assert.equal(browser.audioContexts.length, 1);
-  assert.equal(browser.audioContexts[0].nodes[1].connections.has(browser.audioContexts[0].nodes[3]), true);
+  assert.equal(isBlurred(browser.audioContexts[0]), true);
   assert.equal(lastStatus(browser).status, "applied");
 });
 
@@ -450,10 +449,11 @@ test("every existing speed and lowpass preset remains available", async () => {
     assert.equal((await apply(browser, speed(value))).status, "applied");
     assert.equal(browser.video.playbackRate, value);
   }
-  for (const [preset, cutoff] of [["light", 3500], ["medium", 1800], ["heavy", 900]]) {
+  // Saved Low-Pass presets map onto Gaussian blur levels 1, 3 and 5.
+  for (const [preset, cutoff] of [["light", 4000], ["medium", 2000], ["heavy", 900]]) {
     assert.equal((await apply(browser, lowpass(preset))).status, "applied");
     assert.equal(browser.video.playbackRate, 1);
-    assert.equal(browser.audioContexts[0].nodes[3].frequency.value, cutoff);
+    assertCutoff(browser.audioContexts[0], cutoff);
   }
   await apply(browser, { enabled: false });
   assertDry(browser.audioContexts[0]);

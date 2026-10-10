@@ -116,3 +116,9 @@ input[type="range"] {
 .retry.hidden {
   display: none;
 }
+
+.hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}

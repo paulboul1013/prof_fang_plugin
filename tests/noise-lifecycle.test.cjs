@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createBrowser, MockVideo, deferred } = require("./helpers/browser.cjs");
+const { assertCutoff, isBlurred, isDry } = require("./helpers/browser.cjs");
 
 const noiseUrl = "chrome-extension://test/assets/noise/People Talking Ambience Sound Effect.mp3";
 const noise = (volume = 0.3, url = noiseUrl) => ({ enabled: true, mode: "noise", noiseVolume: volume, noiseUrl: url });
@@ -23,9 +24,7 @@ function assertStopped(player) {
 }
 
 function assertDry(context) {
-  const [, input, mix, filter] = context.nodes;
-  assert.equal(input.connections.has(mix), true);
-  assert.equal(input.connections.has(filter), false);
+  assert.equal(isDry(context), true);
   assert.equal(context.state, "running");
 }
 
@@ -221,8 +220,8 @@ test("speed, lowpass, noise, and OFF retain their original effects and dry origi
   await apply(browser, lowpass("light"));
   assertStopped(browser.audioPlayers[0]);
   const context = browser.audioContexts[0];
-  assert.equal(context.nodes[3].frequency.value, 3500);
-  assert.equal(context.nodes[1].connections.has(context.nodes[3]), true);
+  assertCutoff(context, 4000);
+  assert.equal(isBlurred(context), true);
   await apply(browser, noise(0.5));
   assertDry(context);
   assert.equal(browser.audioContexts.length, 1);
@@ -231,7 +230,7 @@ test("speed, lowpass, noise, and OFF retain their original effects and dry origi
   assert.equal(browser.video.playbackRate, 3);
   assertDry(context);
   await apply(browser, lowpass("heavy"));
-  assert.equal(context.nodes[3].frequency.value, 900);
+  assertCutoff(context, 900);
   await apply(browser, { enabled: false });
   assert.equal(browser.video.playbackRate, 1);
   assertDry(context);
@@ -252,9 +251,7 @@ test("noise restores a cached lowpass graph's dry audio and never reports succes
   assert.equal(context.resumeCalls, 2);
   assert.equal(browser.audioContexts.length, 1);
   assert.equal(browser.audioPlayers.length, 0);
-  const [, input, mix, filter] = context.nodes;
-  assert.equal(input.connections.has(mix), true);
-  assert.equal(input.connections.has(filter), false);
+  assert.equal(isDry(context), true);
 
   blocked = false;
   assert.equal((await apply(browser, noise())).status, "applied");
