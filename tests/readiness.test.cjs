@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createBrowser, deferred } = require("./helpers/browser.cjs");
+const { assertCutoff, isBlurred, isDry } = require("./helpers/browser.cjs");
 
 function apply(browser, settings) {
   return browser.sendRuntime({ type: "PROF_FANG_APPLY_SETTINGS", payload: settings });
@@ -170,7 +171,7 @@ test("repeated content and trainer injection retain one bridge and audio graph",
   assert.equal((await second).ok, true);
   assert.equal(browser.windowListeners.get("message").size, 2);
   assert.equal(browser.audioContexts.length, 1);
-  assert.equal(browser.audioContexts[0].nodes[3].frequency.value, 3500);
+  assertCutoff(browser.audioContexts[0], 4000);
 });
 
 test("speed, lowpass, noise and OFF remain mutually exclusive after startup", async () => {
@@ -187,15 +188,14 @@ test("speed, lowpass, noise and OFF remain mutually exclusive after startup", as
   await browser.flush();
   assert.equal((await lowpass).ok, true);
   const graph = browser.audioContexts[0];
-  const [, inputGain, mixGain, filter] = graph.nodes;
   assert.equal(browser.video.playbackRate, 1);
-  assert.equal(filter.frequency.value, 900);
-  assert.equal(inputGain.connections.has(filter), true);
+  assertCutoff(graph, 900);
+  assert.equal(isBlurred(graph), true);
 
   const noise = apply(browser, { enabled: true, mode: "noise", noiseVolume: 0.2 });
   await browser.flush();
   assert.equal((await noise).ok, true);
-  assert.equal(inputGain.connections.has(mixGain), true);
+  assert.equal(isDry(graph), true);
   assert.equal(browser.audioPlayers[0].paused, false);
   assert.equal(browser.audioPlayers[0].volume, 0.2);
 
@@ -205,7 +205,7 @@ test("speed, lowpass, noise and OFF remain mutually exclusive after startup", as
   assert.equal(browser.video.playbackRate, 1);
   assert.equal(browser.audioPlayers[0].paused, true);
   assert.equal(browser.audioPlayers[0].currentTime, 0);
-  assert.equal(inputGain.connections.has(mixGain), true);
+  assert.equal(isDry(graph), true);
 });
 
 test("unrelated runtime messages do not keep a response channel open", async () => {

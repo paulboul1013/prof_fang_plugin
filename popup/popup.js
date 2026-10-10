@@ -2,22 +2,28 @@ const DEFAULT_STATE = {
   enabled: false,
   mode: "speed",
   speed: 1,
-  lowPassPreset: "medium",
+  blurLevel: 3,
   noiseFile: "People Talking Ambience Sound Effect.mp3",
   noiseVolume: 0.3
 };
 
 const STORAGE_KEY = "profFangState";
+// Gaussian blur strength -> -3 dB cutoff (Hz). Must match injected/trainer.js.
+const BLUR_LEVELS = { 1: 4000, 2: 2800, 3: 2000, 4: 1400, 5: 900 };
+const BLUR_NAMES = { 1: "Light", 2: "Mild", 3: "Medium", 4: "Strong", 5: "Heavy" };
+// Saved settings from the former Low-Pass mode.
+const LEGACY_LOWPASS_LEVELS = { light: 1, medium: 3, heavy: 5 };
 
 const els = {
   enabled: document.getElementById("enabled"),
   enabledLabel: document.getElementById("enabledLabel"),
   modeRadios: Array.from(document.querySelectorAll("input[name='mode']")),
   speedSettings: document.getElementById("speedSettings"),
-  lowpassSettings: document.getElementById("lowpassSettings"),
+  blurSettings: document.getElementById("blurSettings"),
   noiseSettings: document.getElementById("noiseSettings"),
   speed: document.getElementById("speed"),
-  lowPassPreset: document.getElementById("lowPassPreset"),
+  blurLevel: document.getElementById("blurLevel"),
+  blurLevelLabel: document.getElementById("blurLevelLabel"),
   noiseFile: document.getElementById("noiseFile"),
   noiseVolume: document.getElementById("noiseVolume"),
   noiseVolumeLabel: document.getElementById("noiseVolumeLabel"),
@@ -99,10 +105,27 @@ function mergeState(loaded) {
     ...DEFAULT_STATE,
     ...(loaded || {})
   };
-  if (merged.mode !== "speed" && merged.mode !== "lowpass" && merged.mode !== "noise") {
+  if (merged.mode === "lowpass") {
+    merged.mode = "gaussian";
+    if (loaded?.blurLevel === undefined) {
+      merged.blurLevel = LEGACY_LOWPASS_LEVELS[loaded.lowPassPreset] || DEFAULT_STATE.blurLevel;
+    }
+  }
+  delete merged.lowPassPreset;
+  if (merged.mode !== "speed" && merged.mode !== "gaussian" && merged.mode !== "noise") {
     merged.mode = "speed";
   }
+  merged.blurLevel = normalizeBlurLevel(merged.blurLevel);
   return merged;
+}
+
+function normalizeBlurLevel(value) {
+  const level = Math.round(Number(value));
+  return BLUR_LEVELS[level] ? level : DEFAULT_STATE.blurLevel;
+}
+
+function blurLabel(level) {
+  return `${BLUR_NAMES[level]} · ~${BLUR_LEVELS[level]} Hz`;
 }
 
 function selectedMode() {
@@ -120,19 +143,20 @@ function render() {
   }
 
   els.speed.value = String(currentState.speed);
-  els.lowPassPreset.value = currentState.lowPassPreset;
+  els.blurLevel.value = String(currentState.blurLevel);
+  els.blurLevelLabel.textContent = blurLabel(currentState.blurLevel);
   els.noiseFile.value = currentState.noiseFile;
   els.noiseVolume.value = String(currentState.noiseVolume);
   els.noiseVolumeLabel.textContent = `${Math.round(currentState.noiseVolume * 100)}%`;
 
   const activeMode = currentState.enabled ? currentState.mode : "off";
   els.speedSettings.classList.toggle("hidden", activeMode !== "speed");
-  els.lowpassSettings.classList.toggle("hidden", activeMode !== "lowpass");
+  els.blurSettings.classList.toggle("hidden", activeMode !== "gaussian");
   els.noiseSettings.classList.toggle("hidden", activeMode !== "noise");
 
   const disableModeFields = !currentState.enabled;
   els.speed.disabled = disableModeFields;
-  els.lowPassPreset.disabled = disableModeFields;
+  els.blurLevel.disabled = disableModeFields;
   els.noiseFile.disabled = disableModeFields;
   els.noiseVolume.disabled = disableModeFields;
 }
@@ -249,8 +273,12 @@ function bindEvents() {
     await persistAndApply();
   });
 
-  els.lowPassPreset.addEventListener("change", async () => {
-    currentState.lowPassPreset = els.lowPassPreset.value;
+  els.blurLevel.addEventListener("input", () => {
+    els.blurLevelLabel.textContent = blurLabel(normalizeBlurLevel(els.blurLevel.value));
+  });
+
+  els.blurLevel.addEventListener("change", async () => {
+    currentState.blurLevel = normalizeBlurLevel(els.blurLevel.value);
     await persistAndApply();
   });
 

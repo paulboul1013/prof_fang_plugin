@@ -14,21 +14,30 @@
   const MODES = {
     OFF: "off",
     SPEED: "speed",
-    LOWPASS: "lowpass",
+    BLUR: "gaussian",
     NOISE: "noise"
   };
 
-  const LOWPASS_PRESETS = {
-    light: 3500,
-    medium: 1800,
-    heavy: 900
-  };
+  // Gaussian blur strength 1 (light) to 5 (heavy), as the -3 dB cutoff in Hz.
+  // A Gaussian low-pass keeps vowels and rhythm but removes consonant detail
+  // ("s", "f", "th") smoothly, without the resonance or ringing of a biquad.
+  const BLUR_LEVELS = { 1: 4000, 2: 2800, 3: 2000, 4: 1400, 5: 900 };
+  // Removing high frequencies lowers loudness; compensate a little (≤ +2.3 dB)
+  // so users do not raise the volume and get a jump when blur turns off.
+  const BLUR_MAKEUP_GAIN = { 1: 1, 2: 1.06, 3: 1.12, 4: 1.2, 5: 1.3 };
+  const DEFAULT_BLUR_LEVEL = 3;
+  // Settings saved before the Gaussian blur mode used Low-Pass presets.
+  const LEGACY_LOWPASS_LEVELS = { light: 1, medium: 3, heavy: 5 };
+  // Gain changes settle in about 3 time constants (~30 ms), which avoids clicks.
+  const FADE_TIME_CONSTANT = 0.01;
+  // A faded chain is silent (< -80 dB) well before this, then disconnected.
+  const FADE_RELEASE_MS = 200;
 
   const DEFAULT_STATE = {
     enabled: false,
     mode: "speed",
     speed: 1,
-    lowPassPreset: "medium",
+    blurLevel: DEFAULT_BLUR_LEVEL,
     noiseFile: "People Talking Ambience Sound Effect.mp3",
     noiseUrl: "",
     noiseVolume: 0.3
@@ -53,6 +62,26 @@
     return document.querySelector("video");
   }
 
+  // A sampled Gaussian impulse response. Its frequency response is also
+  // Gaussian: H(f) = exp(-f² / (2σf²)), with H(cutoff) = -3 dB.
+  function gaussianKernel(sampleRate, cutoffHz) {
+    const sigmaSeconds = Math.sqrt(Math.LN2) / (2 * Math.PI * cutoffHz);
+    const sigma = sigmaSeconds * sampleRate;
+    const radius = Math.max(1, Math.ceil(4 * sigma));
+    const kernel = new Float32Array(radius * 2 + 1);
+    let sum = 0;
+    for (let i = 0; i < kernel.length; i += 1) {
+      const x = i - radius;
+      kernel[i] = Math.exp(-(x * x) / (2 * sigma * sigma));
+      sum += kernel[i];
+    }
+    // Unity gain at 0 Hz, so low frequencies keep their level.
+    for (let i = 0; i < kernel.length; i += 1) {
+      kernel[i] /= sum;
+    }
+    return kernel;
+  }
+
   function ensureGraph(video) {
     const cached = graphMap.get(video);
     if (cached) {
@@ -63,38 +92,103 @@
     const source = audioContext.createMediaElementSource(video);
     const inputGain = audioContext.createGain();
     const mixGain = audioContext.createGain();
-    const lowpassFilter = audioContext.createBiquadFilter();
-
-    lowpassFilter.type = "lowpass";
+    // The dry path is the original audio. Blur is a parallel wet path, so
+    // turning it on or off is a crossfade instead of a disconnect.
+    const dryGain = audioContext.createGain();
 
     source.connect(inputGain);
-    inputGain.connect(mixGain);
+    inputGain.connect(dryGain);
+    dryGain.connect(mixGain);
     mixGain.connect(audioContext.destination);
 
-    let inLowPassPath = false;
+    const kernelBuffers = new Map();
+    let activeLevel = null;
+    let activeChain = null;
+    const fadingChains = new Set();
 
-    function routeLowPass(enabled) {
-      if (enabled === inLowPassPath) {
+    function fadeTo(param, value) {
+      const now = audioContext.currentTime || 0;
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(param.value, now);
+      param.setTargetAtTime(value, now, FADE_TIME_CONSTANT);
+    }
+
+    function kernelBuffer(level) {
+      if (!kernelBuffers.has(level)) {
+        const kernel = gaussianKernel(audioContext.sampleRate, BLUR_LEVELS[level]);
+        const buffer = audioContext.createBuffer(1, kernel.length, audioContext.sampleRate);
+        buffer.getChannelData(0).set(kernel);
+        kernelBuffers.set(level, buffer);
+      }
+      return kernelBuffers.get(level);
+    }
+
+    function createChain(level) {
+      const convolver = audioContext.createConvolver();
+      // The kernel is already normalized; Web Audio's own normalization would
+      // change its gain.
+      convolver.normalize = false;
+      convolver.buffer = kernelBuffer(level);
+      const gain = audioContext.createGain();
+      gain.gain.value = 0;
+      inputGain.connect(convolver);
+      convolver.connect(gain);
+      gain.connect(mixGain);
+      return { level, convolver, gain };
+    }
+
+    function disconnectChain(chain) {
+      inputGain.disconnect(chain.convolver);
+      chain.convolver.disconnect();
+      chain.gain.disconnect();
+    }
+
+    function fadeOut(chain) {
+      fadeTo(chain.gain.gain, 0);
+      fadingChains.add(chain);
+      clearTimeout(chain.releaseTimer);
+      chain.releaseTimer = setTimeout(() => {
+        if (fadingChains.delete(chain)) {
+          disconnectChain(chain);
+        }
+      }, FADE_RELEASE_MS);
+    }
+
+    function revive(level) {
+      for (const chain of fadingChains) {
+        if (chain.level === level) {
+          fadingChains.delete(chain);
+          clearTimeout(chain.releaseTimer);
+          return chain;
+        }
+      }
+      return null;
+    }
+
+    // level: 1-5 for Gaussian blur, or null for the original audio.
+    function setBlur(level) {
+      if (level === activeLevel) {
         return;
       }
-
-      inputGain.disconnect();
-      lowpassFilter.disconnect();
-
-      if (enabled) {
-        inputGain.connect(lowpassFilter);
-        lowpassFilter.connect(mixGain);
-      } else {
-        inputGain.connect(mixGain);
+      if (activeChain) {
+        fadeOut(activeChain);
+        activeChain = null;
       }
-
-      inLowPassPath = enabled;
+      if (level) {
+        // Reapplying a level (cleanup, then apply) brings the chain that just
+        // started to fade back up instead of starting a new one.
+        activeChain = revive(level) || createChain(level);
+        fadeTo(activeChain.gain.gain, BLUR_MAKEUP_GAIN[level]);
+        fadeTo(dryGain.gain, 0);
+      } else {
+        fadeTo(dryGain.gain, 1);
+      }
+      activeLevel = level;
     }
 
     const graph = {
       audioContext,
-      lowpassFilter,
-      routeLowPass
+      setBlur
     };
 
     graphMap.set(video, graph);
@@ -289,7 +383,7 @@
     // Clear it even when the old video was already removed from the document.
     noiseController.stop();
     if (graph) {
-      graph.routeLowPass(false);
+      graph.setBlur(null);
     }
     if (video) {
       video.playbackRate = 1;
@@ -383,15 +477,27 @@
     return { status: "failed", reason };
   }
 
+  function normalizeBlurLevel(value) {
+    const level = Math.round(Number(value));
+    return BLUR_LEVELS[level] ? level : DEFAULT_BLUR_LEVEL;
+  }
+
   function normalizeState(rawState) {
     const state = {
       ...DEFAULT_STATE,
       ...(rawState || {})
     };
 
-    if (state.mode !== MODES.SPEED && state.mode !== MODES.LOWPASS && state.mode !== MODES.NOISE) {
+    if (state.mode === "lowpass") {
+      state.mode = MODES.BLUR;
+      if (rawState?.blurLevel === undefined) {
+        state.blurLevel = LEGACY_LOWPASS_LEVELS[rawState.lowPassPreset] || DEFAULT_BLUR_LEVEL;
+      }
+    }
+    if (state.mode !== MODES.SPEED && state.mode !== MODES.BLUR && state.mode !== MODES.NOISE) {
       state.mode = MODES.SPEED;
     }
+    state.blurLevel = normalizeBlurLevel(state.blurLevel);
     return state;
   }
 
@@ -417,7 +523,7 @@
       }
       if (activeMode === MODES.SPEED) {
         video.playbackRate = Number(state.speed) || 1;
-      } else if (activeMode === MODES.LOWPASS && !graph) {
+      } else if (activeMode === MODES.BLUR && !graph) {
         try {
           graph = ensureGraph(video);
         } catch (error) {
@@ -464,13 +570,11 @@
       if (!isCurrentOperation(revision, video)) {
         return { status: "superseded" };
       }
-      if (activeMode === MODES.LOWPASS) {
-        const cutoff = LOWPASS_PRESETS[state.lowPassPreset] || LOWPASS_PRESETS.medium;
-        graph.lowpassFilter.frequency.value = cutoff;
-        graph.routeLowPass(true);
+      if (activeMode === MODES.BLUR) {
+        graph.setBlur(state.blurLevel);
       } else if (activeMode === MODES.NOISE) {
         // Noise never creates a media source. A graph previously created by
-        // lowpass must still run its dry path so the original audio is audible.
+        // blur must still run its dry path so the original audio is audible.
         return await noiseController.configure(video, state);
       }
       return { status: "applied" };

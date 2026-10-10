@@ -21,7 +21,7 @@
       <section>
         <h2>Training Mode</h2>
         <label><input type="radio" name="mode" value="speed" /> Speed Training</label>
-        <label><input type="radio" name="mode" value="lowpass" /> Low-Pass Blur</label>
+        <label><input type="radio" name="mode" value="gaussian" /> Gaussian Blur</label>
         <label><input type="radio" name="mode" value="noise" /> Environment Noise</label>
       </section>
 
@@ -36,13 +36,11 @@
         </select>
       </section>
 
-      <section id="lowpassSettings" class="mode-settings hidden">
-        <h2>Low-Pass</h2>
-        <select id="lowPassPreset">
-          <option value="light">Light - 3500 Hz</option>
-          <option value="medium">Medium - 1800 Hz</option>
-          <option value="heavy">Heavy - 900 Hz</option>
-        </select>
+      <section id="blurSettings" class="mode-settings hidden">
+        <h2>Gaussian Blur</h2>
+        <label for="blurLevel">Strength <span id="blurLevelLabel">Medium · ~2000 Hz</span></label>
+        <input id="blurLevel" type="range" min="1" max="5" step="1" value="3" />
+        <p class="hint">Stronger blur removes more consonant detail. Vowels and rhythm stay.</p>
       </section>
 
       <section id="noiseSettings" class="mode-settings hidden">

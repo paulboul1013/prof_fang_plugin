@@ -176,7 +176,7 @@ test("a suspended AudioContext reports waiting for a gesture", async () => {
   const popup = await openPopup(browser);
   popup.setEnabled(true);
   await settle(browser);
-  popup.setMode("lowpass");
+  popup.setMode("gaussian");
   await settle(browser);
   assert.equal(popup.status, "Press play on the video to start audio training");
 });
@@ -213,7 +213,7 @@ test("a resume() that stays pending reports a gesture prompt, then Applied once 
   const popup = await openPopup(browser);
   popup.setEnabled(true);
   await settle(browser);
-  popup.setMode("lowpass");
+  popup.setMode("gaussian");
   await settle(browser);
   assert.equal(popup.status, "Applying...");
 

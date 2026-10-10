@@ -136,16 +136,39 @@ function createBrowser(options = {}) {
     }
   }
 
-  function audioNode() {
+  // Automation completes instantly; the tests check the target values.
+  function audioParam(value) {
     return {
+      value,
+      events: [],
+      cancelScheduledValues(time) {
+        this.events.push(["cancel", time]);
+      },
+      setValueAtTime(target, time) {
+        this.events.push(["set", target, time]);
+        this.value = target;
+      },
+      setTargetAtTime(target, time, timeConstant) {
+        this.events.push(["target", target, time, timeConstant]);
+        this.value = target;
+      }
+    };
+  }
+
+  function audioNode(kind) {
+    return {
+      kind,
       connections: new Set(),
-      gain: { value: 1 },
-      frequency: { value: 0 },
+      gain: audioParam(1),
       connect(destination) {
         this.connections.add(destination);
       },
-      disconnect() {
-        this.connections.clear();
+      disconnect(destination) {
+        if (destination) {
+          this.connections.delete(destination);
+        } else {
+          this.connections.clear();
+        }
       }
     };
   }
@@ -155,6 +178,8 @@ function createBrowser(options = {}) {
       super();
       this.state = options.audioContextState || "running";
       this.destination = {};
+      this.sampleRate = options.sampleRate || 48000;
+      this.currentTime = 0;
       this.nodes = [];
       this.resumeCalls = 0;
       audioContexts.push(this);
@@ -165,22 +190,36 @@ function createBrowser(options = {}) {
         throw new Error("Video already has a MediaElementAudioSourceNode");
       }
       routedVideos.add(element);
-      const source = audioNode();
+      const source = audioNode("source");
       source.video = element;
       this.nodes.push(source);
       return source;
     }
 
     createGain() {
-      const node = audioNode();
+      const node = audioNode("gain");
       this.nodes.push(node);
       return node;
     }
 
-    createBiquadFilter() {
-      const node = audioNode();
+    createConvolver() {
+      const node = audioNode("convolver");
+      node.normalize = true;
+      node.buffer = null;
       this.nodes.push(node);
       return node;
+    }
+
+    createBuffer(channels, length, sampleRate) {
+      const data = Array.from({ length: channels }, () => new Float32Array(length));
+      return {
+        numberOfChannels: channels,
+        length,
+        sampleRate,
+        getChannelData(channel) {
+          return data[channel];
+        }
+      };
     }
 
     async resume() {
@@ -442,7 +481,7 @@ function createPopup(browser, options = {}) {
     }
     return elements.get(id);
   };
-  const modeRadios = ["speed", "lowpass", "noise"].map((value) => {
+  const modeRadios = ["speed", "gaussian", "noise"].map((value) => {
     const radio = createElement(`mode-${value}`);
     radio.value = value;
     return radio;
@@ -520,4 +559,59 @@ function createPopup(browser, options = {}) {
   };
 }
 
-module.exports = { createBrowser, createPopup, MockVideo, deferred };
+// The trainer graph is [source, inputGain, mixGain, dryGain, ...wet chains],
+// where each wet chain is inputGain -> convolver -> gain -> mixGain.
+function graphNodes(context) {
+  const [source, input, mix, dry] = context.nodes;
+  return { source, input, mix, dry };
+}
+
+function activeBlurChains(context) {
+  const { input, mix } = graphNodes(context);
+  return context.nodes.filter((node) => node.kind === "convolver" && input.connections.has(node))
+    .map((convolver) => ({ convolver, gain: [...convolver.connections][0] }))
+    .filter(({ gain }) => gain && gain.gain.value > 0 && gain.connections.has(mix));
+}
+
+// The audible blur's -3 dB cutoff in Hz, derived from the Gaussian kernel's
+// variance (σt), or null when only the original audio is audible.
+function blurCutoff(context) {
+  const chains = activeBlurChains(context);
+  if (chains.length !== 1) {
+    return chains.length ? NaN : null;
+  }
+  const { convolver } = chains[0];
+  const kernel = convolver.buffer.getChannelData(0);
+  const center = (kernel.length - 1) / 2;
+  let sum = 0;
+  let variance = 0;
+  kernel.forEach((value, index) => {
+    sum += value;
+    variance += value * (index - center) ** 2;
+  });
+  const sigmaSeconds = Math.sqrt(variance / sum) / convolver.buffer.sampleRate;
+  return Math.sqrt(Math.LN2) / (2 * Math.PI * sigmaSeconds);
+}
+
+function isDry(context) {
+  const { input, mix, dry } = graphNodes(context);
+  return input.connections.has(dry) && dry.connections.has(mix) && dry.gain.value === 1 &&
+    activeBlurChains(context).length === 0;
+}
+
+function isBlurred(context) {
+  const { dry } = graphNodes(context);
+  return dry.gain.value === 0 && activeBlurChains(context).length === 1;
+}
+
+function assertCutoff(context, hz) {
+  const cutoff = blurCutoff(context);
+  if (!(Math.abs(cutoff - hz) / hz < 0.03)) {
+    throw new Error(`Expected Gaussian blur cutoff ≈ ${hz} Hz, got ${cutoff}`);
+  }
+}
+
+module.exports = {
+  createBrowser, createPopup, MockVideo, deferred,
+  blurCutoff, assertCutoff, isDry, isBlurred, graphNodes
+};

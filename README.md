@@ -5,7 +5,7 @@
 ## 功能特色
 
 - `Speed` 模式：1x / 1.5x / 2x / 2.5x / 3x
-- `Low-Pass` 模式：light / medium / heavy
+- `Gaussian Blur`（高斯模糊）模式：強度 1–5（Light ~4000 Hz → Heavy ~900 Hz）
 - `Noise` 模式：使用 `assets/noise/` 內的本地 mp3（目前為 `People Talking Ambience Sound Effect.mp3`）
 - 同一時間僅允許一種模式啟用
 - 切到 `OFF` 會還原正常播放
